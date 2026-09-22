@@ -11,7 +11,8 @@ import subprocess
 import sys
 import time
 
-from .models import Report, render_markdown, validate_report
+from .models import render_markdown
+from .workflow import StageSpec, run_workflow
 
 
 def write_json(path: Path, data: object) -> None:
@@ -20,20 +21,24 @@ def write_json(path: Path, data: object) -> None:
     temporary.replace(path)
 
 
-def codex_command(work: Path, job: dict) -> list[str]:
+def codex_command(work: Path, job: dict, *, output: Path | None = None,
+                  web_search: bool = True) -> list[str]:
+    schema = output / "schema.json" if output else work / "report-schema.json"
+    result = output / "result.json" if output else work / "model-result.json"
     command = ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--strict-config",
             "--skip-git-repo-check", "--ephemeral", "--color", "never",
             "--sandbox", "danger-full-access", "--model", job["model"],
             "-c", 'approval_policy="never"', "-c", 'cli_auth_credentials_store="file"',
             "-c", f'model_reasoning_effort={json.dumps(job["reasoning"])}',
-            "-c", 'web_search="live"', "-c", "features.multi_agent=true",
+            "-c", f'web_search={json.dumps("live" if web_search else "disabled")}',
+            "-c", "features.multi_agent=true",
             "-c", f'agents.enabled={str(job["max_subagents"] > 0).lower()}',
             "-c", f'agents.default_subagent_model={json.dumps(job["model"])}',
             "-c", f'agents.default_subagent_reasoning_effort={json.dumps(job["reasoning"])}',
             "-c", "features.apps=false", "-c", "features.plugins=false",
             "-c", "allow_login_shell=false", "--cd", str(work), "--json",
-            "--output-schema", str(work / "report-schema.json"),
-            "--output-last-message", str(work / "model-result.json"), "-"]
+            "--output-schema", str(schema),
+            "--output-last-message", str(result), "-"]
     if job["max_subagents"] > 0:
         command[2:2] = ["-c", f'agents.max_concurrent_threads_per_session={job["max_subagents"]}']
     return command
@@ -84,7 +89,8 @@ def main() -> int:
                 "model": job["model"], "reasoning": job["reasoning"],
                 "model_selection": "Explicit Codex CLI configuration; not independent server attestation",
                 "input_sha256": job["input_sha256"], "cutoff_date": job["cutoff_date"],
-                "max_subagents": job["max_subagents"], "page_count": None}
+                "execution": "serial_independent_agents", "nested_subagents": False,
+                "page_count": None}
 
     def remaining() -> float:
         return job["timeout_seconds"] - (time.monotonic() - started)
@@ -103,26 +109,19 @@ def main() -> int:
         metadata["page_count"] = len(pages)
         run_process(["pdftoppm", "-png", "-scale-to", "1600", str(work / "input.pdf"), str(work / "pages/page")],
                     work, min(120, remaining()))
-        schema = Report.model_json_schema()
-        write_json(work / "report-schema.json", schema)
-        instructions = Path(__file__).with_name("review_prompt.md").read_text(encoding="utf-8")
-        metadata["prompt_sha256"] = hashlib.sha256(instructions.encode()).hexdigest()
-        request = "\n\n本次任务参数（作者提供）：\n" + json.dumps(
-            {"focus": job.get("focus", ""), "literature_cutoff": job["cutoff_date"],
-             "physical_page_count": len(pages), "model": job["model"], "reasoning": job["reasoning"],
-             "max_subagents": job["max_subagents"]}, ensure_ascii=False)
-        (work / "prompt.md").write_text(instructions + request, encoding="utf-8")
-        write_json(work / "progress.json", {"stage": "reviewing"})
-        run_process(codex_command(work, job), work, remaining(), prompt=instructions + request,
-                    stdout_name="events.jsonl", stderr_name="codex-stderr.log")
+        def invoke(stage: StageSpec, prompt: str, output: Path, budget: float) -> None:
+            # Each role gets a new context; serial calls also avoid concurrent auth refresh.
+            stage_job = {**job, "max_subagents": 0}
+            run_process(codex_command(work, stage_job, output=output, web_search=stage.web_search),
+                        work, min(budget, remaining()), prompt=prompt,
+                        stdout_name=str(output / "events.jsonl"),
+                        stderr_name=str(output / "codex-stderr.log"))
+
+        report, trace = run_workflow(work, job, pages, invoke=invoke, timeout_seconds=remaining())
+        metadata["prompt_sha256"] = trace["prompt_bundle_sha256"]
         write_json(work / "progress.json", {"stage": "validating"})
-        report = Report.model_validate_json((work / "model-result.json").read_text(encoding="utf-8"))
-        errors = validate_report(report, pages)
         if hashlib.sha256((work / "input.pdf").read_bytes()).hexdigest() != job["input_sha256"]:
-            errors.append("Input PDF changed during review")
-        if errors:
-            metadata["validation_errors"] = errors
-            raise ValueError("Report failed evidence/coverage validation")
+            raise ValueError("Input PDF changed during review")
         write_json(work / "result.json", report.model_dump())
         (work / "report.md").write_text(render_markdown(report, metadata), encoding="utf-8")
         metadata["status"] = "succeeded"
@@ -134,8 +133,13 @@ def main() -> int:
     finally:
         metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
         metadata["elapsed_seconds"] = round(time.monotonic() - started, 2)
-        metadata["parent_turn_usage"] = read_usage(work / "events.jsonl")
-        metadata["usage_note"] = "CLI-reported parent turn usage; do not assume it includes all subagent consumption"
+        workflow_path = work / "workflow.json"
+        if workflow_path.is_file():
+            metadata["workflow"] = json.loads(workflow_path.read_text(encoding="utf-8"))
+            metadata["prompt_sha256"] = metadata["workflow"]["prompt_bundle_sha256"]
+            for stage in metadata["workflow"]["stages"]:
+                stage["usage"] = read_usage(work / "stages" / stage["id"] / "events.jsonl")
+        metadata["usage_note"] = "CLI-reported final turn usage for each independent stage; nested agents disabled"
         write_json(work / "run.json", metadata)
     return 0 if metadata["status"] == "succeeded" else 1
 

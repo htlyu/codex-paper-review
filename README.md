@@ -2,9 +2,24 @@
 
 上传一份 PDF 后，本机 Python API 为该任务启动一个独立 Docker 容器，调用 Codex 检查论文并生成中文问题清单。服务只分析上传的 PDF 和可公开检索的文献，不读取论文的 LaTeX 源码、私有实验数据或整个仓库。报告中的页码均为 **PDF 的物理页码，从 1 开始**，可能与论文印刷页码不同。
 
-Docker 中运行的是 Codex 客户端和 PDF 工具，模型推理在云端进行，需要联网；论文内容会作为审阅输入发送给模型。默认使用 `gpt-6-astra`、`xhigh` 推理强度，最多 6 个子 agent。任务沿用当前 Codex 账户可用的模型访问和额度；配置模型名称不会增加账户权限。Codex 的非交互模式和账户认证方式见 [OpenAI Docs：非交互运行](https://learn.chatgpt.com/docs/non-interactive-mode)与[身份验证](https://learn.chatgpt.com/docs/auth)。
+Docker 中运行的是 Codex 客户端和 PDF 工具，模型推理在云端进行，需要联网；论文内容会作为审阅输入发送给模型。默认使用 `gpt-6-astra`、`xhigh` 推理强度，依次运行 11 个独立的角色阶段。任务沿用当前 Codex 账户可用的模型访问和额度；配置模型名称不会增加账户权限。Codex 的非交互模式和账户认证方式见 [OpenAI Docs：非交互运行](https://learn.chatgpt.com/docs/non-interactive-mode)与[身份验证](https://learn.chatgpt.com/docs/auth)。
 
 服务面向自己上传的可信 PDF，默认只监听 `127.0.0.1:8787`。它提供 HTTP API，没有上传网站；Swagger `/docs`、`/redoc` 和 OpenAPI JSON 均关闭。服务不用于多用户或公网服务。结果是作者自查材料；对于无法从 PDF 或公开来源确认的问题，仍需要作者检查原始证据。
+
+## ScholarPeer 角色流程
+
+提示词参考 [ScholarPeer v2 附录 G](https://arxiv.org/pdf/2601.22638v2)，按 CC BY 4.0 改编为作者自查用途。每个阶段都实际启动一次独立的 `codex exec`，读取公共约束、对应角色 prompt 和指定上游 JSON：
+
+1. 中立摘要与主张提取。
+2. 文献初查 → 文献补查 → 领域发展脉络。
+3. 独立基线与数据集检查，仅接收摘要，避免被前面的文献结论引导。
+4. 分别生成新颖性问题与技术问题。
+5. 分别调查新颖性答案与技术答案。
+6. 独立反证复核所有候选问题 → 综合最终报告。
+
+共 11 次独立调用，按依赖顺序串行执行，禁用嵌套子代理。各阶段有明确的联网设置和固定权重的时间预算；这不是 PAT 的难度自适应预算算法。文本引文、页码、来源字段和反证处置经过程序校验；最终报告只能原样选取反证阶段保留的问题，不能重新加入已撤回的问题。语义判断和真实视觉查看仍依赖模型，字段校验不能证明判断正确。
+
+保留了 ScholarPeer 的角色分工与先提问后调查流程，去掉固定问题/文献配额、会场白名单、“没搜到即高创新”和“不确定即拒稿”等规则；新增独立反证步骤，不输出录用分数。附录 H 的评估 prompts 依赖人工审稿或成对评审数据，不放入论文自查主流程。具体 prompt、来源与每项改动见[角色映射](docs/scholarpeer-prompts.md)和[第三方归属声明](THIRD_PARTY_NOTICES.md)。本项目不声称完整复现 ScholarPeer 或 Google PAT。
 
 ## 准备与启动
 
@@ -129,7 +144,7 @@ curl --fail-with-body \
   -o run.json
 ```
 
-`report.md` 用于阅读，`result.json` 保存结构化审阅结果，`run.json` 记录本次运行信息。报告和结构化结果仅在成功后可下载；失败任务若已生成 `run.json`，可下载该文件排查原因。取消尚未结束的任务：
+`report.md` 用于阅读，`result.json` 保存结构化审阅结果，`run.json` 记录本次运行信息，以及 11 个阶段的输入依赖、prompt 摘要、耗时、CLI 用量和已校验的中间结果。报告和结构化结果仅在成功后可下载；失败任务若已生成 `run.json`，可下载该文件排查原因。取消尚未结束的任务：
 
 ```sh
 curl --fail-with-body -X POST \
@@ -160,15 +175,15 @@ curl --fail-with-body -X POST \
 | `REVIEW_DOCKER_IMAGE` | `paper-review-worker:local` | 已构建的任务镜像 |
 | `REVIEW_DOCKER_BIN` | `docker` | 本机 Docker CLI 路径 |
 | `REVIEW_PROXY_URL` | 空（直接连接） | 可选的既有网络代理；宿主机代理可填 `http://host.docker.internal:7897` |
-| `REVIEW_MODEL` | `gpt-6-astra` | 父 agent 与子 agent 使用的模型 |
+| `REVIEW_MODEL` | `gpt-6-astra` | 所有角色阶段使用的模型 |
 | `REVIEW_REASONING` | `xhigh` | 推理强度 |
-| `REVIEW_MAX_SUBAGENTS` | `6` | 一个任务可创建的并行子 agent 上限 |
+| `REVIEW_MAX_SUBAGENTS` | `6` | 保留的旧配置；当前角色流程禁用嵌套子代理，该值不影响阶段数量 |
 | `REVIEW_TIMEOUT_SECONDS` | `3600` | 每任务最长运行时间（秒） |
 | `REVIEW_MAX_UPLOAD_BYTES` | `20971520` | PDF 文件大小上限（20 MiB） |
 | `REVIEW_MAX_PAGES` | `100` | PDF 页数上限 |
 | `REVIEW_MAX_PENDING_JOBS` | `20` | 未结束的任务数量上限，包含当前执行中的任务 |
 
-默认每份文件最多 20 MiB、100 页，不接受加密 PDF。一次只执行一个任务；每次任务只有一个 Codex 父进程，子 agent 按任务需要创建，上限不代表每次都会使用全部子 agent。API 的任务状态保存在本机。超时或取消会停止任务容器；如果 Docker 无法确认停止，任务会进入 `cleanup_failed`，队列停止接新任务。重启时先确认本任务库的遗留容器已停止，再恢复排队任务；之前中断的任务不会自动重跑，需要重新上传。
+默认每份文件最多 20 MiB、100 页，不接受加密 PDF。一次只执行一个任务；每次任务依次启动 11 个独立 Codex 进程，同一时刻只运行一个角色。多阶段流程通常比单次调用耗时更多；总预算不足或中间产物未通过校验时，任务会失败并保存阶段状态。API 的任务状态保存在本机。超时或取消会停止任务容器；如果 Docker 无法确认停止，任务会进入 `cleanup_failed`，队列停止接新任务。重启时先确认本任务库的遗留容器已停止，再恢复排队任务；之前中断的任务不会自动重跑，需要重新上传。
 
 每个任务的 Docker 容器采用以下边界：
 
@@ -190,11 +205,13 @@ Codex 在这个隔离容器中使用 `danger-full-access` 和 `approval_policy=n
 - **容器直连返回 403、而本机通过代理可以访问**：将既有代理地址填入 `REVIEW_PROXY_URL` 后重启 API。容器里的 `127.0.0.1` 指向容器自身；宿主机代理使用 `host.docker.internal`。该设置不改变系统代理。
 - **达到时间、内存或 PDF 限制**：查看失败原因，减少输入范围或调整任务配置后重新提交。
 
-更多诊断信息保存在本机 `REVIEW_DATA_DIR/jobs/<任务 id>/` 下：`container.log` 记录容器启动与退出信息，`preparation.log` 记录 PDF 预处理，`codex-stderr.log` 记录 Codex 错误。未到相应阶段时，部分文件可能尚未生成。这些内部日志不通过下载接口提供。
+更多诊断信息保存在本机 `REVIEW_DATA_DIR/jobs/<任务 id>/` 下：`container.log` 记录容器启动与退出信息，`preparation.log` 记录 PDF 预处理，`stages/<阶段名>/codex-stderr.log` 记录各阶段 Codex 错误；同目录的 `prompt.md`、`schema.json`、`result.json`、`events.jsonl` 保留实际输入、输出约束、原始结果及工具事件。`workflow.json` 持续更新阶段进度，最终合并到可下载的 `run.json`。未到相应阶段时，部分文件可能尚未生成。这些内部日志不通过下载接口提供。
 
-2026-09-22 已在 macOS / Apple Silicon / Colima 环境中完成镜像构建和真实云端联调：使用本机登录文件、`gpt-6-astra` / `xhigh`，上传一页合成 PDF，完成文本提取、页面渲染、审阅、证据核验，以及三份结果的 HTTP 下载。报告正确指出“30 题答对 24 题，却报告 90%”的矛盾；实际应为 80%。该任务耗时约 195 秒。这个样例验证了执行链路，不能证明复杂论文审查质量或与 PAT 等效。
+2026-09-22 已在 macOS / Apple Silicon / Colima 环境中完成真实云端联调：使用本机登录文件、`gpt-6-astra` / `xhigh`，上传一页合成 PDF，11 个独立阶段全部执行成功，耗时约 557 秒。技术回答与独立反证均确认“30 题答对 24 题，却报告 90%”的矛盾；实际应为 80%。三份结果均通过 HTTP 下载，`run.json` 包含 11 份阶段结果及 CLI 用量；任务容器和私有凭据副本正常清理。
 
-31 项服务测试通过，覆盖队列、鉴权、上传限制、证据核验、取消、超时、异常恢复、凭据刷新和代理参数。复跑：
+这个合成样例将文献、基线和新颖性检查限定为不适用，验证的是阶段调用、数据传递、数字核查、复核和报告生成，不能证明真实文献搜索质量、复杂论文审查质量或与 PAT 等效。实测之后仅细化了反证阶段无法查看证据页时的暂撤说明，该降级分支另有回归测试。
+
+44 项服务测试通过，覆盖队列、鉴权、上传限制、证据核验、取消、超时、异常恢复、凭据刷新、代理参数，以及 11 阶段的 prompt 注入、依赖传递、新增主张、反证与最终结果约束。复跑：
 
 ```sh
 .venv/bin/python -m pip install -r requirements-dev.txt

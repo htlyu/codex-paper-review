@@ -58,6 +58,16 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("agents.enabled=false", disabled)
         self.assertFalse(any("max_concurrent_threads" in arg for arg in disabled))
 
+    def test_stage_command_uses_its_schema_result_and_search_policy(self):
+        output = Path("/work/stages/technical_answers")
+        command = codex_command(Path("/work"),
+                                {"model": "gpt-6-astra", "reasoning": "xhigh", "max_subagents": 0},
+                                output=output, web_search=False)
+        self.assertEqual(command[command.index("--output-schema") + 1], str(output / "schema.json"))
+        self.assertEqual(command[command.index("--output-last-message") + 1], str(output / "result.json"))
+        self.assertIn('web_search="disabled"', command)
+        self.assertIn("agents.enabled=false", command)
+
 
 class DockerRunnerTests(unittest.TestCase):
     def setUp(self):
