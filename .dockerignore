@@ -1,0 +1,15 @@
+# Only the runtime package and dependency manifest enter the build context.
+**
+!Dockerfile
+!requirements.txt
+!paper_review_service/
+!paper_review_service/**
+
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.env
+**/.env.*
+**/auth.json
+**/.codex/
+**/.DS_Store

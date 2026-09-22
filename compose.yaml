@@ -1,0 +1,14 @@
+name: paper-review
+
+services:
+  # Build only. The host API starts one isolated docker run per submitted PDF.
+  review-worker:
+    image: paper-review-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CODEX_VERSION: "0.155.1"
+    profiles: [worker]
+
+# No host home, repository, Docker socket, credential volume, or data volume.

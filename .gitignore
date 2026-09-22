@@ -1,0 +1,10 @@
+.env
+.venv/
+var/
+__pycache__/
+*.pyc
+.env.*
+!.env.example
+.codex/
+auth.json
+.DS_Store
